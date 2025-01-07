@@ -79,7 +79,7 @@ async def process_single_pdf(pdf_file) -> Tuple[List[Document], Dict]:
 
     # Split text into smaller chunks with more overlap
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,  
+        chunk_size=1000,  
         chunk_overlap=200,  
         length_function=len,
         separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]  
@@ -123,8 +123,7 @@ async def process_pdfs(pdf_files: List[Any]) -> Tuple[List[Document], Dict[str, 
     results = await asyncio.gather(*tasks)
 
     for pdf_file, (docs, metadata) in zip(pdf_files, results):
-        documents.extend(docs)
-        pdf_file.seek(0)
+        documents.extend(docs)  # Combines documents from all PDFs
         pdf_bytes_dict[pdf_file.name] = pdf_file.read()
 
     return documents, pdf_bytes_dict
@@ -224,17 +223,15 @@ def setup_qa_chain(documents: List[Document], current_pdfs: List[str] = None) ->
 
     Instructions:
     - Use ONLY the information provided in the context above
-    - If the answer cannot be found in the context, say "I cannot answer this based on the current documents"
     - Do not make assumptions or use external knowledge
 
     Your response should follow this structure:
     Answer: [Your main response here]
-    Sources: [List the document names used]
+    Sources: [List the document name]
     Conflicts: [If any conflicting information exists, explain here]
 
     Remember to:
     - Draw connections between documents
-    - Be specific about which source provided which information
     - Only use information from the provided context
     Avoid using markdown or HTML formatting in your response
     """
