@@ -134,6 +134,12 @@ if uploaded_files and all(hasattr(f, 'read') for f in uploaded_files):
                     # Process all PDFs
                     documents, pdf_bytes_dict = await process_pdfs(new_files)
                     
+                    # Store PDF bytes for all files, not just new ones
+                    for file in uploaded_files:
+                        if file.name not in st.session_state.pdf_bytes_dict:
+                            file.seek(0)  # Reset file pointer
+                            st.session_state.pdf_bytes_dict[file.name] = file.read()
+                    
                     # Update existing RAG chain with new documents
                     if st.session_state.rag_chain is None or st.session_state.retriever is None:
                         # First time setup
@@ -141,12 +147,9 @@ if uploaded_files and all(hasattr(f, 'read') for f in uploaded_files):
                     else:
                         rag_chain, retriever = setup_qa_chain(documents, current_pdfs)
                     
-
                     st.session_state.rag_chain = rag_chain
                     st.session_state.retriever = retriever
                     st.session_state.uploaded_files = uploaded_files
-  
-                    st.session_state.pdf_bytes_dict.update(pdf_bytes_dict)
                     st.session_state.processing_complete = True
                     
                     return len(new_files)
@@ -325,11 +328,18 @@ with st.sidebar:
         text_to_highlight = st.session_state.current_pdf['text']
 
         try:
-            # Get PDF bytes
+            # Get PDF bytes and verify they're not empty
             pdf_bytes = st.session_state.pdf_bytes_dict[pdf_name]
-            
+            if not pdf_bytes:
+                st.error(f"No PDF data found for {pdf_name}")
+                st.stop()
+                
             # Add page navigation
             highlighted_pdf_bytes, total_pages, current_page = highlight_pdf(pdf_bytes, text_to_highlight)
+            
+            if not highlighted_pdf_bytes:
+                st.error("Failed to process PDF for highlighting")
+                st.stop()
             
             # Page navigation
             page_number = st.number_input(
@@ -343,6 +353,10 @@ with st.sidebar:
             
             # Highlight text on the selected page
             highlighted_pdf_bytes, _, _ = highlight_pdf(pdf_bytes, text_to_highlight, page_number - 1)
+            
+            if not highlighted_pdf_bytes:
+                st.error("Failed to highlight PDF")
+                st.stop()
             
             # Convert to base64 for display
             b64_pdf = get_pdf_display_base64(highlighted_pdf_bytes)
@@ -374,16 +388,19 @@ with st.sidebar:
                         st.session_state.page_number = min(total_pages, page_number + 1)
                         st.rerun()
                 with col3:
-                    st.download_button(
-                        label="⬇️ Download",
-                        data=highlighted_pdf_bytes,
-                        file_name=f"highlighted_{pdf_name}",
-                        mime="application/pdf"
-                    )
+                    if highlighted_pdf_bytes:  # Only show download if we have valid PDF
+                        st.download_button(
+                            label="⬇️ Download",
+                            data=highlighted_pdf_bytes,
+                            file_name=f"highlighted_{pdf_name}",
+                            mime="application/pdf"
+                        )
             else:
-                st.error("Error displaying PDF. Please try again.")
+                st.error("Error converting PDF for display")
         except Exception as e:
             st.error(f"Error processing PDF: {str(e)}")
+            import traceback
+            st.error(traceback.format_exc())
     else:
         st.info("Select a source to view the PDF with highlights")
         
