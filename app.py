@@ -9,7 +9,46 @@ import os
 import shutil
 
 load_dotenv()
-
+async def cleanup_chroma_db():
+    """Safely clean up ChromaDB resources"""
+    try:
+        # Close any existing ChromaDB connections
+        if hasattr(st.session_state, 'retriever') and st.session_state.retriever:
+            if hasattr(st.session_state.retriever, '_collection'):
+                try:
+                    st.session_state.retriever._collection.client.close()
+                except Exception:
+                    pass  # Ignore errors during client close
+                
+        # Clear session state
+        if hasattr(st.session_state, 'rag_chain'):
+            del st.session_state.rag_chain
+        if hasattr(st.session_state, 'retriever'):
+            del st.session_state.retriever
+            
+        # Initialize ChromaDB if it doesn't exist
+        if not os.path.exists(".chroma_db"):
+            os.makedirs(".chroma_db", exist_ok=True)
+            
+            # Initialize a new ChromaDB client to ensure the tenant is created
+            import chromadb
+            client = chromadb.Client(
+                chromadb.Settings(
+                    is_persistent=True,
+                    persist_directory=".chroma_db",
+                    anonymized_telemetry=False
+                )
+            )
+            # Create default tenant if it doesn't exist
+            try:
+                client.create_tenant("default_tenant")
+            except Exception:
+                pass  # Tenant might already exist
+            client.close()
+            
+    except Exception as e:
+        st.error(f"Error during ChromaDB cleanup: {str(e)}")
+        raise
 # Check for API key
 if not os.getenv("GOOGLE_API_KEY"):
     st.error("Please set your GOOGLE_API_KEY in the .env file")
@@ -88,30 +127,35 @@ if uploaded_files and all(hasattr(f, 'read') for f in uploaded_files):
             # Process PDFs asynchronously
             async def process_files():
                 try:
-                    # Clear existing cache directory
-                    import shutil
-                    if os.path.exists(".chroma_db"):
-                        shutil.rmtree(".chroma_db")
+                    # Process only new PDFs
+                    new_files = [f for f in uploaded_files if f.name not in previous_files]
+                    current_pdfs = [f.name for f in uploaded_files]
                     
                     # Process all PDFs
-                    documents, pdf_bytes_dict = await process_pdfs(uploaded_files)
+                    documents, pdf_bytes_dict = await process_pdfs(new_files)
                     
-                    # Setup RAG chain with all documents
-                    rag_chain, retriever = setup_qa_chain(documents)
+                    # Update existing RAG chain with new documents
+                    if st.session_state.rag_chain is None or st.session_state.retriever is None:
+                        # First time setup
+                        rag_chain, retriever = setup_qa_chain(documents, current_pdfs)
+                    else:
+                        rag_chain, retriever = setup_qa_chain(documents, current_pdfs)
                     
-                    # Update session state
+
                     st.session_state.rag_chain = rag_chain
                     st.session_state.retriever = retriever
                     st.session_state.uploaded_files = uploaded_files
-                    st.session_state.pdf_bytes_dict = pdf_bytes_dict
+  
+                    st.session_state.pdf_bytes_dict.update(pdf_bytes_dict)
                     st.session_state.processing_complete = True
                     
-                    return len(uploaded_files)
+                    return len(new_files)
                 except Exception as e:
-                    st.error(f"Error processing PDFs: {str(e)}")
+                    import traceback
+                    st.error(f"Error processing PDFs: {str(e)}\n{traceback.format_exc()}")
                     return 0
             
-            # Run async processing
+
             with ThreadPoolExecutor() as executor:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
@@ -121,25 +165,25 @@ if uploaded_files and all(hasattr(f, 'read') for f in uploaded_files):
             if num_processed > 0:
                 st.success(f"Successfully processed {num_processed} PDF(s)!")
 
-    # Display uploaded files with metadata
+
     if st.session_state.processing_complete:
         st.markdown("### Uploaded Documents")
         for file in uploaded_files:
             with st.expander(f"📄 {file.name}"):
                 st.markdown(f"**Size:** {file.size / 1024:.1f} KB")
                 if st.button(f"Remove {file.name}"):
-                    # Remove file from session state
-                    st.session_state.uploaded_files = [
-                        f for f in st.session_state.uploaded_files if f.name != file.name
-                    ]
-                    # Clear the RAG chain and retriever
-                    st.session_state.rag_chain = None
-                    st.session_state.retriever = None
-                    # Clear the PDF bytes dictionary
-                    st.session_state.pdf_bytes_dict = {}
-                    # Clear processing complete flag
-                    st.session_state.processing_complete = False
-                    st.rerun()
+                    try:
+      
+                        st.session_state.uploaded_files = [
+                            f for f in st.session_state.uploaded_files if f.name != file.name
+                        ]
+
+                        if file.name in st.session_state.pdf_bytes_dict:
+                            del st.session_state.pdf_bytes_dict[file.name]
+                        
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error removing file: {str(e)}")
     
     # PDF Viewer Triggered by "View in PDF" Button
     if st.session_state.processing_complete:
@@ -152,20 +196,22 @@ if uploaded_files and all(hasattr(f, 'read') for f in uploaded_files):
         if question and st.session_state.rag_chain:
             with st.spinner("Searching through documents..."):
                 # Get response with context
+                current_pdfs = [f.name for f in st.session_state.uploaded_files]
                 answer, sources, context_used = get_response(
                     st.session_state.rag_chain,
                     st.session_state.retriever,
                     question,
-                    st.session_state.chat_history
+                    st.session_state.chat_history,
+                    current_pdfs
                 )
                 
                 # Update chat history
                 st.session_state.chat_history.append((question, answer))
                 
-                # Display answer in a card-like container
+                
                 st.markdown("### Answer:")
                 
-                # Split the answer into sections and format them
+                
                 sections = answer.split('\n')
                 answer_content = ""
                 sources_content = ""
@@ -187,7 +233,7 @@ if uploaded_files and all(hasattr(f, 'read') for f in uploaded_files):
                         elif conflicts_content:
                             conflicts_content += f" {line}"
 
-                # Display the main answer
+   
                 st.markdown(
                     f"""
                     <div style="border:1px solid #ddd; padding:20px; border-radius:5px; margin-bottom:20px; background-color:#262730; color:white;">
@@ -197,7 +243,7 @@ if uploaded_files and all(hasattr(f, 'read') for f in uploaded_files):
                     unsafe_allow_html=True
                 )
                 
-                # Display sources if present
+
                 if sources_content:
                     st.markdown(
                         f"""
@@ -209,7 +255,7 @@ if uploaded_files and all(hasattr(f, 'read') for f in uploaded_files):
                         unsafe_allow_html=True
                     )
                 
-                # Display conflicts if present
+
                 if conflicts_content and conflicts_content.lower() != "none":
                     st.markdown(
                         f"""
@@ -221,7 +267,7 @@ if uploaded_files and all(hasattr(f, 'read') for f in uploaded_files):
                         unsafe_allow_html=True
                     )
                 
-                # Display sources grouped by document
+
                 with st.expander("📚 View Sources", expanded=True):
                     # Group sources by document
                     sources_by_doc = {}
@@ -302,7 +348,6 @@ with st.sidebar:
             b64_pdf = get_pdf_display_base64(highlighted_pdf_bytes)
             
             if b64_pdf:
-                # Display current page info
                 st.markdown(f"**Viewing page {page_number} of {total_pages}**")
                 
                 # Display PDF with highlights
@@ -329,7 +374,6 @@ with st.sidebar:
                         st.session_state.page_number = min(total_pages, page_number + 1)
                         st.rerun()
                 with col3:
-                    # Add download button
                     st.download_button(
                         label="⬇️ Download",
                         data=highlighted_pdf_bytes,
@@ -343,7 +387,6 @@ with st.sidebar:
     else:
         st.info("Select a source to view the PDF with highlights")
         
-        # Display some instructions
         st.markdown("""
         #### How to view PDFs:
         1. Click on "🔍 View in PDF" next to any source
@@ -351,3 +394,4 @@ with st.sidebar:
         3. The relevant text will be highlighted in yellow
         4. Use the download button to save the highlighted PDF
         """)
+

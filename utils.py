@@ -20,6 +20,7 @@ from pathlib import Path
 from pydantic import BaseModel
 import os
 import shutil
+import chromadb
 
 load_dotenv()
 
@@ -63,7 +64,6 @@ async def extract_text_from_pdf(pdf_file) -> tuple[str, str, bytes, dict]:
 
 async def process_single_pdf(pdf_file) -> Tuple[List[Document], Dict]:
     """Process a single PDF file with caching"""
-    # Get file hash for caching
     pdf_file.seek(0)
     file_hash = get_file_hash(pdf_file.read())
     cache_path = get_cache_path(file_hash)
@@ -75,19 +75,17 @@ async def process_single_pdf(pdf_file) -> Tuple[List[Document], Dict]:
             documents = [Document(**doc) for doc in cached_data['documents']]
             return documents, cached_data['metadata']
 
-    # Process file if not cached
     text, filename, pdf_bytes, metadata = await extract_text_from_pdf(pdf_file)
 
     # Split text into smaller chunks with more overlap
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,  # Smaller chunks
-        chunk_overlap=200,  # More overlap
+        chunk_size=500,  
+        chunk_overlap=200,  
         length_function=len,
-        separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]  # More granular splitting
+        separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]  
     )
     chunks = text_splitter.split_text(text)
 
-    # Create documents with enhanced metadata
     documents = [
         Document(
             page_content=chunk,
@@ -124,7 +122,6 @@ async def process_pdfs(pdf_files: List[Any]) -> Tuple[List[Document], Dict[str, 
     tasks = [process_single_pdf(pdf_file) for pdf_file in pdf_files]
     results = await asyncio.gather(*tasks)
 
-    # Combine results
     for pdf_file, (docs, metadata) in zip(pdf_files, results):
         documents.extend(docs)
         pdf_file.seek(0)
@@ -140,7 +137,6 @@ def highlight_pdf(pdf_bytes: bytes, text_to_highlight: str, page_number: int = N
         current_page = page_number if page_number is not None else 0
         current_page = min(max(0, current_page), total_pages - 1)
 
-        # Prepare text chunks
         text_chunks = []
         for sentence in text_to_highlight.replace('. ', '.|').replace('? ', '?|').replace('! ', '!|').split('|'):
             if sentence:
@@ -153,7 +149,7 @@ def highlight_pdf(pdf_bytes: bytes, text_to_highlight: str, page_number: int = N
         
         for pg_num in pages_to_search:
             page = doc.load_page(pg_num)
-            page.clean_contents()  # Clean existing annotations
+            page.clean_contents()  
             
             for chunk in text_chunks:
                 text_instances = page.search_for(chunk.strip())
@@ -177,100 +173,105 @@ def highlight_pdf(pdf_bytes: bytes, text_to_highlight: str, page_number: int = N
         if 'doc' in locals():
             doc.close()
 
-def setup_qa_chain(documents: List[Document]):
-    """
-    Set up the question-answering chain with Gemini
-    """
+def setup_qa_chain(documents: List[Document], current_pdfs: List[str] = None) -> Tuple[Any, Any]:
+    """Setup RAG chain with documents"""
+    
     # Initialize embeddings
     embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-
-    # Create vector store with metadata filtering
-    vectorstore = Chroma.from_documents(
-        documents=documents,
-        embedding=embeddings,
-        persist_directory=".chroma_db"
+    
+    chroma_settings = chromadb.Settings(
+        is_persistent=True,
+        persist_directory=".chroma_db",
+        anonymized_telemetry=False
     )
     
     try:
-        # Clear any existing collection
-        vectorstore.delete_collection()
+        vectorstore = Chroma(
+            embedding_function=embeddings,
+            client_settings=chroma_settings,
+            collection_name="pdf_collection"
+        )
+        
+        # Add new documents to existing collection
+        if documents:
+            vectorstore.add_documents(documents)
+            
+    except Exception as e:
+        # If collection doesn't exist, create new one
         vectorstore = Chroma.from_documents(
             documents=documents,
             embedding=embeddings,
-            persist_directory=".chroma_db"
+            client_settings=chroma_settings,
+            collection_name="pdf_collection"
         )
-    except Exception as e:
-        print(f"Error while resetting collection: {str(e)}")
 
-    # Configure retriever for better cross-document search
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
+    
+    # Setup retriever with filter for current PDFs
+    search_kwargs = {"k": 4}
+    if current_pdfs:
+        search_kwargs["filter"] = {"source": {"$in": current_pdfs}}
+        
     retriever = vectorstore.as_retriever(
-        search_type="similarity",  # Use similarity search
-        search_kwargs={
-            "k": 10,  # Increase number of chunks retrieved
-            "filter": None  # No filtering to allow cross-document search
-        }
+        search_type="similarity",
+        search_kwargs=search_kwargs
     )
-
-    # Create prompt template for cross-document QA
-    template = """Based on the following context from multiple documents, provide a comprehensive answer:
-    Context:
+    
+    template = """Answer the question based ONLY on the following context. Do not use any other information:
     {context}
-
+    
     Question: {question}
 
     Instructions:
+    - Use ONLY the information provided in the context above
+    - If the answer cannot be found in the context, say "I cannot answer this based on the current documents"
+    - Do not make assumptions or use external knowledge
 
-    Provide a clear and concise answer using information from all relevant documents
-    Cite the source documents for each piece of information
-    If there are conflicts between sources, explain the differences
     Your response should follow this structure:
-
     Answer: [Your main response here]
     Sources: [List the document names used]
     Conflicts: [If any conflicting information exists, explain here]
+
     Remember to:
     - Draw connections between documents
-    - Use information from all relevant sources
     - Be specific about which source provided which information
+    - Only use information from the provided context
     Avoid using markdown or HTML formatting in your response
     """
-
+    
     prompt = ChatPromptTemplate.from_template(template)
-
-    # Initialize Gemini
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash-001",
-        temperature=0.3,
-    )
-
-    # Create RAG chain
-    rag_chain = (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+    
+    chain = (
+        {"context": retriever, "question": RunnablePassthrough()}
         | prompt
         | llm
         | StrOutputParser()
     )
+    
+    return chain, retriever
 
-    return rag_chain, retriever
-
-def get_response(rag_chain, retriever, question: str, chat_history: List[Tuple[str, str]]) -> Tuple[str, List[Document], str]:
+def get_response(rag_chain, retriever, question: str, chat_history: List[Tuple[str, str]], current_pdfs: List[str] = None) -> Tuple[str, List[Document], str]:
     """
     Get response from the RAG chain with cross-document context
     Returns: (answer, sources, context_used)
     """
     # Get relevant documents and their content
     docs = retriever.invoke(question)
+    
+    # Filter docs to only include current PDFs if specified
+    if current_pdfs:
+        docs = [doc for doc in docs if doc.metadata.get("source") in current_pdfs]
+    
     context_used = format_docs(docs)  # Get the actual context used
 
     # Get answer
     answer = rag_chain.invoke(question)
 
-    # Extract unique source documents
     sources = []
     seen_sources = set()
     for doc in docs:
         source = doc.metadata.get("source", "Unknown")
-        if source not in seen_sources:
+        if source not in seen_sources and (not current_pdfs or source in current_pdfs):
             sources.append(doc)
             seen_sources.add(source)
 
